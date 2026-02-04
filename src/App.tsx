@@ -3,6 +3,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { PHOTO_STANDARDS, CATEGORY_LABELS, PAPER_FORMATS } from './constants';
 import { PassportStandard, CropState, GeminiAnalysis, UsageCategory } from './types';
 import { PassportAI } from './services/geminiService';
+import { ImageProcessor } from './services/imageProcessing';
 
 const App: React.FC = () => {
   const [sourceImage, setSourceImage] = useState<string | null>(null);
@@ -88,15 +89,18 @@ const App: React.FC = () => {
     setCrop(prev => ({ ...prev, x: newX, y: newY }));
   }, [crop.scale]);
 
+  // ... (existing imports)
+
   const handleBackgroundRemoval = async () => {
     if (!sourceImage) return;
     setIsRemovingBg(true);
     try {
-      const ai = new PassportAI();
-      const result = await ai.removeBackground(sourceImage);
-      if (result) setSourceImage(result);
+      // Use local WASM model
+      const result = await ImageProcessor.removeBackground(sourceImage);
+      setSourceImage(result);
     } catch (err) {
-      alert("IA Error: Background removal failed.");
+      console.error(err);
+      alert("Erreur de détourage. Veuillez réessayer.");
     } finally {
       setIsRemovingBg(false);
     }
@@ -106,13 +110,18 @@ const App: React.FC = () => {
     if (!sourceImage) return;
     setIsAutoWorking(true);
     try {
-      const ai = new PassportAI();
-      const result = await ai.autoProcessPhoto(sourceImage);
-      if (result) {
-        setSourceImage(result);
-      }
+      // 1. Remove Background
+      const bgRemoved = await ImageProcessor.removeBackground(sourceImage);
+      // 2. Auto Crop (Center for now)
+      const cropped = await ImageProcessor.autoCrop(bgRemoved);
+
+      setSourceImage(cropped);
+      // 3. Reset crop state to fit new image
+      setCrop({ x: 0, y: 0, scale: 1 });
+      setTimeout(fitImageToFrame, 100);
     } catch (err) {
-      alert("IA Error: Auto-process failed.");
+      console.error(err);
+      alert("Erreur du traitement automatique.");
     } finally {
       setIsAutoWorking(false);
     }
@@ -456,69 +465,84 @@ const App: React.FC = () => {
         </div>
 
         {/* RIGHT: RENDER & ANALYSIS */}
-        <div className="xl:col-span-4 flex flex-col gap-8">
-          <div className="bg-white rounded-[40px] p-10 shadow-sm border border-slate-100 flex-grow flex flex-col min-h-[600px]">
-            <h2 className="text-2xl font-black mb-8 text-slate-800 flex items-center gap-3">
+        <div className="xl:col-span-4 flex flex-col gap-6">
+          <div className="bg-white rounded-[32px] p-8 shadow-xl border border-slate-100 flex-grow flex flex-col min-h-[600px] relative overflow-hidden">
+            {/* DECORATIVE BLOB */}
+            <div className="absolute -top-20 -right-20 w-64 h-64 bg-indigo-50 rounded-full blur-3xl opacity-50 pointer-events-none"></div>
+
+            <h2 className="text-xl font-black mb-6 text-slate-800 flex items-center gap-3 relative z-10">
               Rendu Final
-              <span className="px-3 py-1 bg-emerald-50 text-emerald-600 text-[10px] rounded-full uppercase">Biometric OK</span>
+              <span className={`px-3 py-1 text-[10px] rounded-full uppercase tracking-widest ${analysis?.isCompliant ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                {analysis?.isCompliant ? 'Validé' : 'Aperçu'}
+              </span>
             </h2>
 
-            <div className="flex-grow flex flex-col gap-8">
+            <div className="flex-grow flex flex-col gap-6 relative z-10">
               {sheetRender ? (
-                <div className="animate-in slide-in-from-right duration-500">
-                  <div className="bg-slate-50 p-6 rounded-[32px] border border-slate-100 flex flex-col items-center mb-10 group">
-                    <label className="block text-[10px] font-black text-slate-400 uppercase mb-6 tracking-widest text-center">Planche d'Impression (4 Copies)</label>
-                    <div className="w-full aspect-square bg-white p-3 shadow-2xl rounded-2xl border border-slate-200 overflow-hidden relative">
-                      <img src={sheetRender} alt="Final" className="w-full h-full object-contain transition-transform group-hover:scale-105 duration-700" />
+                <div className="animate-in slide-in-from-right duration-500 flex flex-col h-full">
+
+                  {/* PREVIEW CONTAINER */}
+                  <div className="flex-grow flex items-center justify-center p-4">
+                    <div className="relative group perspective-[1000px]">
+                      <div className="absolute inset-0 bg-indigo-500/20 blur-2xl rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-700"></div>
+                      <div className="relative bg-white p-2 shadow-[0_20px_50px_-12px_rgba(0,0,0,0.15)] rounded border border-slate-100 transition-transform duration-500 group-hover:rotate-x-2 group-hover:-translate-y-2">
+                        <img src={sheetRender} alt="Final" className="w-[280px] h-auto object-contain" />
+                        {/* PAPER TEXTURE OVERLAY (Optional) */}
+                        <div className="absolute inset-0 bg-gradient-to-tr from-black/5 to-transparent pointer-events-none mix-blend-multiply"></div>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 gap-4 mb-8">
+                  {/* ACTION GRID */}
+                  <div className="grid grid-cols-2 gap-3 mt-auto pt-6 border-t border-slate-50">
                     <a
                       href={sheetRender}
-                      download="PasseportPro_Export.jpg"
-                      className="w-full bg-slate-900 hover:bg-black text-white py-5 rounded-2xl font-bold transition-all flex items-center justify-center gap-3 shadow-xl hover:-translate-y-1 active:scale-95"
+                      download="PasseportPro_Planche.jpg"
+                      className="col-span-2 bg-slate-900 hover:bg-black text-white py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg hover:shadow-slate-500/20 hover:-translate-y-0.5"
                     >
-                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" /></svg>
-                      Exporter en HD
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" /></svg>
+                      Télécharger HD
                     </a>
+
                     <button
                       onClick={handlePrint}
-                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-5 rounded-2xl font-bold transition-all flex items-center justify-center gap-3 shadow-xl hover:-translate-y-1 active:scale-95"
+                      className="col-span-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
                     >
-                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
-                      Imprimer Planche
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
+                      Imprimer
+                    </button>
+
+                    <button
+                      onClick={() => setSheetRender(null)}
+                      className="col-span-1 bg-slate-50 hover:bg-slate-100 text-slate-600 py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
+                    >
+                      Retour
                     </button>
                   </div>
 
-                  {/* AI VALIDATION */}
-                  <div className={`p-8 rounded-[32px] border-2 transition-all duration-500 ${analysis ? (analysis.isCompliant ? 'bg-emerald-50 border-emerald-100' : 'bg-rose-50 border-rose-100') : 'bg-slate-50 border-slate-100'}`}>
-                    <div className="flex items-center justify-between mb-6">
-                      <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Score de Conformité</span>
-                      {isAnalyzing && <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>}
-                    </div>
-                    {analysis ? (
-                      <div className="space-y-5">
-                        <div className="flex items-baseline justify-between">
-                          <p className={`text-xl font-black ${analysis.isCompliant ? 'text-emerald-800' : 'text-rose-800'}`}>{analysis.score}%</p>
-                          <p className={`text-xs font-bold uppercase ${analysis.isCompliant ? 'text-emerald-600' : 'text-rose-600'}`}>{analysis.isCompliant ? 'Valide' : 'Ajuster'}</p>
-                        </div>
-                        <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
-                          <div className={`h-full transition-all duration-1000 ${analysis.isCompliant ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${analysis.score}%` }}></div>
-                        </div>
-                        <ul className="space-y-3 pt-4 border-t border-black/5">
-                          {analysis.feedback.map((f, i) => <li key={i} className="text-xs font-medium text-slate-600 flex gap-3"><span className="text-indigo-400">•</span>{f}</li>)}
-                        </ul>
+                  {/* AI FEEDBACK COMPACT */}
+                  {analysis && (
+                    <div className={`mt-4 p-4 rounded-xl border text-xs ${analysis.isCompliant ? 'bg-emerald-50/50 border-emerald-100 text-emerald-800' : 'bg-rose-50/50 border-rose-100 text-rose-800'}`}>
+                      <div className="flex items-center justify-between font-bold mb-2">
+                        <span>Conformité IA</span>
+                        <span>{analysis.score}%</span>
                       </div>
-                    ) : (!isAnalyzing && <p className="text-xs text-slate-400 font-medium italic text-center">En attente de validation finale.</p>)}
-                  </div>
+                      <div className="w-full bg-slate-200/50 h-1.5 rounded-full overflow-hidden mb-2">
+                        <div className={`h-full rounded-full ${analysis.isCompliant ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${analysis.score}%` }}></div>
+                      </div>
+                      {/* Just showing first feedback item for compactness */}
+                      <p className="opacity-80 truncate">{analysis.feedback[0]}</p>
+                    </div>
+                  )}
+
                 </div>
               ) : (
-                <div className="flex-grow flex flex-col items-center justify-center p-12 bg-slate-50 rounded-[32px] border-2 border-dashed border-slate-100 group">
-                  <div className="w-20 aspect-[3/4] bg-white rounded-xl shadow-sm border border-slate-200 mb-6 flex items-center justify-center group-hover:scale-110 transition-transform duration-500">
-                    <svg className="w-8 h-8 text-slate-100" fill="currentColor" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" /></svg>
+                <div className="flex-grow flex flex-col items-center justify-center p-8 bg-slate-50/50 rounded-2xl border border-dashed border-slate-200 group hover:bg-slate-50 transition-colors">
+                  <div className="w-16 h-16 bg-white rounded-2xl shadow-sm border border-slate-100 mb-4 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
+                    <svg className="w-6 h-6 text-slate-300 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
                   </div>
-                  <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest text-center">Preview Area</p>
+                  <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest text-center">Aucun rendu généré</p>
+                  <p className="text-slate-300 text-[10px] text-center mt-1">Cliquez sur VALIDER pour créer la planche</p>
                 </div>
               )}
             </div>
