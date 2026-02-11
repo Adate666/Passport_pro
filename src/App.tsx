@@ -265,6 +265,12 @@ const App: React.FC = () => {
     sCtx.fillRect(0, 0, pWidth, pHeight);
 
     sCtx.drawImage(imageRef.current, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, pWidth, pHeight);
+
+    // Add black border for cutting guide
+    sCtx.lineWidth = 4; // ~0.33mm at 300 DPI
+    sCtx.strokeStyle = '#000000';
+    sCtx.strokeRect(0, 0, pWidth, pHeight);
+
     const singleDataUrl = singleCanvas.toDataURL('image/jpeg', 0.98);
     setFinalRender(singleDataUrl);
 
