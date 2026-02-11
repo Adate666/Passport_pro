@@ -13,6 +13,25 @@ const App: React.FC = () => {
   const [finalRender, setFinalRender] = useState<string | null>(null);
   const [sheetRender, setSheetRender] = useState<string | null>(null);
 
+  // --- INTERACTIVE LAYOUT STATE ---
+  const [layoutOffset, setLayoutOffset] = useState({ x: 0, y: 0 });
+  const [isDraggingLayout, setIsDraggingLayout] = useState(false);
+  const layoutDragRef = useRef({ startX: 0, startY: 0, initialOffsetX: 0, initialOffsetY: 0 });
+  const [layoutConfig, setLayoutConfig] = useState<{
+    sheetWidth: number;
+    sheetHeight: number;
+    photoWidth: number;
+    photoHeight: number;
+    gap: number;
+    cols: number;
+    rows: number;
+    startX: number;
+    startY: number;
+    columnsUsed: number;
+    dpiScale: number;
+  } | null>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+
   // Custom Printing Options
   const [photoCount, setPhotoCount] = useState<number>(4);
   const [selectedPaperId, setSelectedPaperId] = useState<string>('10x15');
@@ -166,12 +185,26 @@ const App: React.FC = () => {
       setCrop(prev => ({ ...prev, x: clientX - dragStart.x, y: clientY - dragStart.y }));
     } else if (isDraggingBar) {
       setControlBarPos({ x: clientX - barDragStart.x, y: clientY - barDragStart.y });
+    } else if (isDraggingLayout) {
+      if (!layoutConfig || !previewContainerRef.current) return;
+
+      const rect = previewContainerRef.current.getBoundingClientRect();
+      const scale = rect.width > 0 ? rect.width / layoutConfig.sheetWidth : 1;
+
+      const deltaX = (clientX - layoutDragRef.current.startX) / scale;
+      const deltaY = (clientY - layoutDragRef.current.startY) / scale;
+
+      setLayoutOffset({
+        x: layoutDragRef.current.initialOffsetX + deltaX,
+        y: layoutDragRef.current.initialOffsetY + deltaY
+      });
     }
-  }, [isDragging, isDraggingBar, dragStart, barDragStart]);
+  }, [isDragging, isDraggingBar, isDraggingLayout, dragStart, barDragStart, layoutConfig]);
 
   const handleGlobalMouseUp = () => {
     setIsDragging(false);
     setIsDraggingBar(false);
+    setIsDraggingLayout(false);
   };
 
   useEffect(() => {
@@ -187,14 +220,32 @@ const App: React.FC = () => {
     };
   }, [handleGlobalMouseMove]);
 
-  const generateFinalRender = () => {
+  // --- NOUVELLE LOGIQUE INTERACTIVE ---
+
+  const handleLayoutMouseDown = (e: React.MouseEvent | React.TouchEvent) => {
+    e.stopPropagation();
+    if (!layoutConfig) return;
+    setIsDraggingLayout(true);
+    const clientX = 'touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX;
+    const clientY = 'touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY;
+
+    layoutDragRef.current = {
+      startX: clientX,
+      startY: clientY,
+      initialOffsetX: layoutOffset.x,
+      initialOffsetY: layoutOffset.y
+    };
+  };
+
+  const updateLayout = () => {
     if (!imageRef.current || !workspaceRef.current) return;
 
+    // 1. Générer la photo individuelle
     const singleCanvas = document.createElement('canvas');
     const sCtx = singleCanvas.getContext('2d');
     if (!sCtx) return;
 
-    const dpiScale = 11.811;
+    const dpiScale = 11.811; // 300 DPI
     const pWidth = Math.round(selectedStandard.widthMm * dpiScale);
     const pHeight = Math.round(selectedStandard.heightMm * dpiScale);
     singleCanvas.width = pWidth;
@@ -209,15 +260,15 @@ const App: React.FC = () => {
     const sourceWidth = frame.width * scaleFactor;
     const sourceHeight = frame.height * scaleFactor;
 
+    // Fill white background first (fix for transparent images becoming black in JPEG)
+    sCtx.fillStyle = '#FFFFFF';
+    sCtx.fillRect(0, 0, pWidth, pHeight);
+
     sCtx.drawImage(imageRef.current, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, pWidth, pHeight);
     const singleDataUrl = singleCanvas.toDataURL('image/jpeg', 0.98);
     setFinalRender(singleDataUrl);
 
-    const sheetCanvas = document.createElement('canvas');
-    const shCtx = sheetCanvas.getContext('2d');
-    if (!shCtx) return;
-
-    // Determine paper size
+    // 2. Calculer les dimensions du papier
     let paperWidthMm = 0;
     let paperHeightMm = 0;
 
@@ -231,65 +282,132 @@ const App: React.FC = () => {
         paperHeightMm = format.heightMm;
       }
     }
-
-    // Default to 10x15 if something is wrong
     if (paperWidthMm <= 0) paperWidthMm = 100;
     if (paperHeightMm <= 0) paperHeightMm = 150;
 
     const sheetWidth = Math.round(paperWidthMm * dpiScale);
     const sheetHeight = Math.round(paperHeightMm * dpiScale);
 
-    sheetCanvas.width = sheetWidth;
-    sheetCanvas.height = sheetHeight;
-
-    shCtx.fillStyle = '#FFFFFF';
-    shCtx.fillRect(0, 0, sheetCanvas.width, sheetCanvas.height);
-
-    // Layout calculation
-    const margin = Math.round(4 * dpiScale);
+    // 3. Calculer la grille optimale
+    const gap = Math.round(1 * dpiScale); // 1mm
     const photoW = pWidth;
     const photoH = pHeight;
 
-    // Simple grid layout
-    let currentX = margin;
-    let currentY = margin;
-    let photosDrawn = 0;
-
-    for (let i = 0; i < photoCount; i++) {
-      // Check if we need to wrap to next line
-      if (currentX + photoW + margin > sheetWidth) {
-        currentX = margin;
-        currentY += photoH + margin;
-      }
-
-      // Check if we fit properly
-      if (currentY + photoH + margin <= sheetHeight) {
-        shCtx.drawImage(singleCanvas, currentX, currentY);
-        currentX += photoW + margin;
-        photosDrawn++;
-      } else {
-        // Out of space on paper
-        break;
+    const cols = Math.floor((sheetWidth + gap) / (photoW + gap));
+    let effectiveGap = gap;
+    let effectiveCols = cols;
+    if (cols * photoW > sheetWidth || (cols * (photoW + gap) - gap) > sheetWidth) {
+      const tightCols = Math.floor(sheetWidth / photoW);
+      if (tightCols >= cols) {
+        effectiveGap = 0;
+        effectiveCols = tightCols;
       }
     }
 
-    const sheetDataUrl = sheetCanvas.toDataURL('image/jpeg', 0.98);
-    setSheetRender(sheetDataUrl);
+    const rowsNeeded = Math.ceil(photoCount / effectiveCols);
+    const columnsUsed = Math.min(photoCount, effectiveCols);
+
+    const blockWidth = columnsUsed * photoW + (columnsUsed - 1) * effectiveGap;
+    const blockHeight = rowsNeeded * photoH + (rowsNeeded - 1) * effectiveGap;
+
+    const startX = (sheetWidth - blockWidth) / 2;
+    const startY = (sheetHeight - blockHeight) / 2;
+
+    setLayoutConfig({
+      sheetWidth,
+      sheetHeight,
+      photoWidth: photoW,
+      photoHeight: photoH,
+      gap: effectiveGap,
+      cols: effectiveCols,
+      rows: rowsNeeded,
+      startX,
+      startY,
+      columnsUsed,
+      dpiScale
+    });
+    setLayoutOffset({ x: 0, y: 0 });
+    setSheetRender("true"); // Signale qu'on est en mode rendu
+
     analyzeWithAI(singleDataUrl);
   };
 
-  const handlePrint = () => {
-    if (!sheetRender) return;
+  const generateHiResSheet = async () => {
+    if (!layoutConfig || !finalRender) return null;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = layoutConfig.sheetWidth;
+    canvas.height = layoutConfig.sheetHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const img = new Image();
+    img.src = finalRender;
+
+    return new Promise<string>((resolve) => {
+      img.onload = () => {
+        const startX = layoutConfig.startX + layoutOffset.x;
+        const startY = layoutConfig.startY + layoutOffset.y;
+
+        let currentX = startX;
+        let currentY = startY;
+
+        for (let i = 0; i < photoCount; i++) {
+          ctx.drawImage(img, currentX, currentY, layoutConfig.photoWidth, layoutConfig.photoHeight);
+
+          if ((i + 1) % layoutConfig.columnsUsed === 0) {
+            currentX = startX;
+            currentY += layoutConfig.photoHeight + layoutConfig.gap;
+          } else {
+            currentX += layoutConfig.photoWidth + layoutConfig.gap;
+          }
+        }
+        resolve(canvas.toDataURL('image/jpeg', 0.98));
+      };
+      img.onerror = () => resolve('');
+    });
+  };
+
+  const handleDownloadSheet = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    const dataUrl = await generateHiResSheet();
+    if (dataUrl) {
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = 'PasseportPro_Planche.jpg';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  };
+
+  const handleDownloadSingle = () => {
+    if (finalRender) {
+      const link = document.createElement('a');
+      link.href = finalRender;
+      link.download = 'PasseportPro_Single.jpg';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  };
+
+  const handlePrint = async () => {
+    const dataUrl = await generateHiResSheet();
+    if (!dataUrl) return;
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
     printWindow.document.write(`
       <html>
         <head><title>Impression - PasseportPro</title><style>
-          body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background: #fff; }
-          img { width: 100%; max-width: 12cm; height: auto; border: 1px solid #eee; }
-          @page { size: portrait; margin: 10mm; }
+           body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background: #fff; }
+           img { width: 100%; max-width: 100%; height: auto; border: 1px solid #eee; }
+           @page { size: auto; margin: 0mm; }
         </style></head>
-        <body onload="window.print(); window.close();"><img src="${sheetRender}" /></body>
+        <body onload="window.print(); window.close();"><img src="${dataUrl}" /></body>
       </html>
     `);
     printWindow.document.close();
@@ -298,50 +416,50 @@ const App: React.FC = () => {
   const aspectRatio = selectedStandard.widthMm / selectedStandard.heightMm;
 
   return (
-    <div className="min-h-screen bg-[#fcfdfe] text-slate-900 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-900">
+    <div className="min-h-screen bg-[#fcfdfe] text-slate-900 flex flex-col font-sans selection:bg-brand-100 selection:text-brand-900 overflow-x-hidden">
 
       {/* HEADER PROFESSIONNEL */}
-      <header className="px-6 lg:px-12 py-8 flex flex-col md:flex-row items-center justify-between gap-6 border-b border-slate-100 bg-white/50 backdrop-blur-md sticky top-0 z-40">
+      <header className="px-6 lg:px-12 py-8 flex flex-col md:flex-row items-center justify-between gap-6 border-b border-slate-100 bg-white/70 backdrop-blur-xl sticky top-0 z-50">
         <div
-          className="flex items-center gap-6 cursor-pointer hover:opacity-80 transition-opacity"
+          className="flex items-center gap-6 cursor-pointer group"
           onClick={() => window.location.reload()}
-          title="Rafraîchir l'application"
         >
-          <div className="w-14 h-14 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-2xl flex items-center justify-center text-white shadow-2xl shadow-indigo-100 rotate-2">
+          <div className="w-14 h-14 bg-gradient-to-br from-brand-600 to-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-2xl shadow-brand-200 rotate-2 group-hover:rotate-0 transition-transform duration-300">
             <svg className="w-9 h-9" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
             </svg>
           </div>
           <div>
             <h1 className="text-3xl font-black text-slate-900 tracking-tighter leading-none mb-1">PasseportPro</h1>
-            <p className="text-slate-400 font-bold text-xs tracking-widest uppercase">Biometric Editor Engine</p>
+            <p className="text-slate-400 font-bold text-[10px] tracking-[0.2em] uppercase">Biometric Editor Engine</p>
           </div>
         </div>
 
         <div className="flex items-center gap-4">
-          <label className="group bg-slate-900 hover:bg-black text-white px-8 py-4 rounded-2xl cursor-pointer transition-all duration-300 font-bold flex items-center gap-3 shadow-xl shadow-slate-200 hover:-translate-y-1">
-            <svg className="w-6 h-6 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <label className="group bg-slate-950 hover:bg-black text-white px-8 py-4 rounded-2xl cursor-pointer transition-all duration-500 font-bold flex items-center gap-3 shadow-2xl shadow-slate-200 hover:-translate-y-1 active:scale-95">
+            <svg className="w-6 h-6 text-brand-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" />
             </svg>
-            Importer Photo
+            <span className="tracking-wide">Importer Photo</span>
             <input type="file" className="hidden" accept="image/*" onChange={handleFileUpload} />
           </label>
         </div>
       </header>
 
       {/* MAIN LAYOUT */}
-      <main className="max-w-[1600px] w-full mx-auto p-6 lg:p-12 grid grid-cols-1 xl:grid-cols-12 gap-10 flex-grow">
+      <main className="max-w-[1700px] w-full mx-auto p-6 lg:p-12 grid grid-cols-1 xl:grid-cols-12 gap-10 flex-grow">
 
         {/* LEFT: SETTINGS & WORKSPACE */}
-        <div className="xl:col-span-8 flex flex-col gap-8 h-full">
+        <div className="xl:col-span-8 flex flex-col gap-8">
 
-          <div className="bg-white rounded-[40px] p-10 shadow-sm border border-slate-100 flex flex-col h-full relative">
+          <div className="bg-white rounded-[40px] p-8 lg:p-12 shadow-[0_32px_80px_-20px_rgba(0,0,0,0.04)] border border-slate-100 flex flex-col relative overflow-hidden group/card">
+            <div className="absolute top-0 right-0 w-64 h-64 bg-brand-50/30 rounded-full blur-3xl -mr-32 -mt-32"></div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-12 relative z-10">
               <div className="space-y-3">
                 <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Destination</label>
                 <select
-                  className="w-full bg-slate-50 border-none rounded-2xl px-6 py-4 text-base font-bold text-slate-800 focus:ring-4 focus:ring-indigo-100 outline-none transition-all cursor-pointer shadow-inner"
+                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:bg-white focus:ring-4 focus:ring-brand-50 outline-none transition-all cursor-pointer shadow-sm"
                   value={selectedCountry}
                   onChange={(e) => setSelectedCountry(e.target.value)}
                 >
@@ -351,7 +469,7 @@ const App: React.FC = () => {
               <div className="space-y-3">
                 <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Catégorie</label>
                 <select
-                  className="w-full bg-slate-50 border-none rounded-2xl px-6 py-4 text-base font-bold text-slate-800 focus:ring-4 focus:ring-indigo-100 outline-none transition-all cursor-pointer shadow-inner"
+                  className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:bg-white focus:ring-4 focus:ring-brand-50 outline-none transition-all cursor-pointer shadow-sm"
                   value={selectedCategory}
                   onChange={(e) => setSelectedCategory(e.target.value as UsageCategory)}
                 >
@@ -362,10 +480,10 @@ const App: React.FC = () => {
               </div>
 
               <div className="space-y-3">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Format Papier</label>
-                <div className="flex gap-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Papier</label>
+                <div className={`flex gap-2 ${selectedPaperId === 'custom' ? 'flex-col' : ''}`}>
                   <select
-                    className="w-full bg-slate-50 border-none rounded-2xl px-6 py-4 text-base font-bold text-slate-800 focus:ring-4 focus:ring-indigo-100 outline-none transition-all cursor-pointer shadow-inner"
+                    className="flex-grow bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:bg-white focus:ring-4 focus:ring-brand-50 outline-none transition-all cursor-pointer shadow-sm"
                     value={selectedPaperId}
                     onChange={(e) => setSelectedPaperId(e.target.value)}
                   >
@@ -374,51 +492,57 @@ const App: React.FC = () => {
                     ))}
                   </select>
                   {selectedPaperId === 'custom' && (
-                    <div className="flex gap-2">
-                      <input
-                        type="number"
-                        placeholder="W"
-                        className="w-20 bg-slate-50 rounded-2xl px-4 font-bold text-center outline-none focus:ring-2 focus:ring-indigo-100"
-                        value={customPaperSize.width}
-                        onChange={(e) => setCustomPaperSize(p => ({ ...p, width: parseInt(e.target.value) || 0 }))}
-                      />
-                      <input
-                        type="number"
-                        placeholder="H"
-                        className="w-20 bg-slate-50 rounded-2xl px-4 font-bold text-center outline-none focus:ring-2 focus:ring-indigo-100"
-                        value={customPaperSize.height}
-                        onChange={(e) => setCustomPaperSize(p => ({ ...p, height: parseInt(e.target.value) || 0 }))}
-                      />
+                    <div className="flex gap-2 animate-in slide-in-from-top duration-300">
+                      <div className="flex-grow relative group">
+                        <input
+                          type="number"
+                          placeholder="Largeur (mm)"
+                          className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:bg-white focus:ring-4 focus:ring-brand-50 outline-none transition-all shadow-sm"
+                          value={customPaperSize.width}
+                          onChange={(e) => setCustomPaperSize(p => ({ ...p, width: parseInt(e.target.value) || 0 }))}
+                        />
+                        <span className="absolute right-4 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-300 pointer-events-none">W</span>
+                      </div>
+                      <div className="flex-grow relative group">
+                        <input
+                          type="number"
+                          placeholder="Hauteur (mm)"
+                          className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:bg-white focus:ring-4 focus:ring-brand-50 outline-none transition-all shadow-sm"
+                          value={customPaperSize.height}
+                          onChange={(e) => setCustomPaperSize(p => ({ ...p, height: parseInt(e.target.value) || 0 }))}
+                        />
+                        <span className="absolute right-4 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-300 pointer-events-none">H</span>
+                      </div>
                     </div>
                   )}
                 </div>
               </div>
 
               <div className="space-y-3">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Nombre de Photos</label>
-                <div className="flex items-center gap-4 bg-slate-50 rounded-2xl p-2 pr-6">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Quantité</label>
+                <div className="flex items-center gap-3 bg-slate-50 border border-slate-100 rounded-2xl p-1.5 shadow-sm">
                   <button
                     onClick={() => setPhotoCount(Math.max(1, photoCount - 1))}
-                    className="w-10 h-10 bg-white shadow-sm rounded-xl text-slate-600 font-bold hover:bg-slate-100 transition-colors"
+                    className="w-10 h-10 bg-white shadow-sm rounded-xl text-slate-600 font-bold hover:bg-slate-100 active:scale-90 transition-all"
                   >-</button>
-                  <span className="flex-grow text-center font-black text-xl text-slate-800">{photoCount}</span>
+                  <span className="flex-grow text-center font-black text-base text-slate-800">{photoCount}</span>
                   <button
                     onClick={() => setPhotoCount(Math.min(50, photoCount + 1))}
-                    className="w-10 h-10 bg-white shadow-sm rounded-xl text-slate-600 font-bold hover:bg-slate-100 transition-colors"
+                    className="w-10 h-10 bg-white shadow-sm rounded-xl text-slate-600 font-bold hover:bg-slate-100 active:scale-90 transition-all"
                   >+</button>
                 </div>
               </div>
             </div>
 
-            {/* ZONE DE TRAVAIL - NO OVERFLOW HIDDEN HERE TO SEE TOOLBAR */}
-            <div className="relative flex-grow flex items-center justify-center rounded-[32px] bg-slate-50 border-2 border-dashed border-slate-100 min-h-[500px]">
+            {/* ZONE DE TRAVAIL */}
+            <div className="relative flex-grow flex items-center justify-center rounded-[40px] bg-slate-50/50 border-2 border-dashed border-slate-200 min-h-[550px] group-hover/card:bg-slate-50 transition-colors duration-700">
 
               {sourceImage ? (
                 <div
-                  className={`relative overflow-hidden shadow-2xl bg-white ring-[12px] ring-white transition-all duration-700 ${isRemovingBg || isAutoWorking ? 'opacity-40 grayscale blur-sm' : 'opacity-100'}`}
+                  className={`relative overflow-hidden shadow-[0_40px_100px_-20px_rgba(0,0,0,0.1)] bg-white ring-[16px] ring-white transition-all duration-700 ${isRemovingBg || isAutoWorking ? 'opacity-40 grayscale blur-sm' : 'opacity-100 hover:shadow-brand-500/10'}`}
                   style={{
-                    width: '340px',
-                    height: `${340 / aspectRatio}px`,
+                    width: '380px',
+                    height: `${380 / aspectRatio}px`,
                   }}
                   ref={workspaceRef}
                   onMouseDown={handleMouseDown}
@@ -439,29 +563,29 @@ const App: React.FC = () => {
                   />
 
                   {/* GUIDES BIOMÉTRIQUES VISIBLES */}
-                  <div className="absolute inset-0 pointer-events-none border-[1px] border-slate-200">
-                    <div className="w-full h-px bg-indigo-500/20 absolute top-[30%]"></div>
-                    <div className="w-full h-px bg-indigo-500/20 absolute top-[65%]"></div>
-                    <div className="w-[62%] h-[68%] border-2 border-dashed border-indigo-400/30 rounded-[45%] absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-[55%]"></div>
+                  <div className="absolute inset-0 pointer-events-none border-[1px] border-slate-100">
+                    <div className="w-full h-px bg-brand-500/10 absolute top-[30%] shadow-[0_0_10px_rgba(96,165,250,0.2)]"></div>
+                    <div className="w-full h-px bg-brand-500/10 absolute top-[65%] shadow-[0_0_10px_rgba(96,165,250,0.2)]"></div>
+                    <div className="w-[62%] h-[68%] border-2 border-dashed border-brand-400/20 rounded-[45%] absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-[55%]"></div>
                   </div>
                 </div>
               ) : (
-                <div className="text-center p-20 animate-in fade-in zoom-in duration-700">
-                  <div className="w-24 h-24 bg-white rounded-3xl flex items-center justify-center mx-auto mb-8 text-slate-200 shadow-xl border border-slate-50">
-                    <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div className="text-center p-20 animate-in fade-in zoom-in duration-1000">
+                  <div className="w-28 h-28 bg-white rounded-[40px] flex items-center justify-center mx-auto mb-10 text-slate-200 shadow-2xl border border-slate-50 rotate-3 animate-pulse">
+                    <svg className="w-14 h-14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                     </svg>
                   </div>
-                  <h3 className="text-xl font-black text-slate-800 mb-2">En attente de photo...</h3>
-                  <p className="text-slate-400 font-medium max-w-xs mx-auto text-sm leading-relaxed">Importez un portrait pour commencer l'édition haute précision.</p>
+                  <h3 className="text-2xl font-black text-slate-800 mb-4">Prêt pour le shooting ?</h3>
+                  <p className="text-slate-400 font-medium max-w-xs mx-auto text-sm leading-relaxed">Glissez votre photo ici ou utilisez le bouton d'importation.</p>
                 </div>
               )}
 
               {/* CHARGEMENT ÉTAT IA */}
               {(isRemovingBg || isAutoWorking) && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/60 backdrop-blur-xl z-30 transition-all rounded-[32px]">
-                  <div className="w-16 h-16 border-4 border-indigo-600/10 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
-                  <p className="text-sm font-black text-indigo-900 uppercase tracking-widest">{isAutoWorking ? 'Magic Process...' : 'Background Cleanup...'}</p>
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/60 backdrop-blur-2xl z-40 transition-all rounded-[40px]">
+                  <div className="w-20 h-20 border-4 border-brand-100 border-t-brand-600 rounded-full animate-spin mb-8 shadow-2xl shadow-brand-200"></div>
+                  <p className="text-sm font-black text-brand-900 uppercase tracking-[0.3em] font-mono animate-pulse">{isAutoWorking ? 'Neural Analysis...' : 'Cleaning Canvas...'}</p>
                 </div>
               )}
             </div>
@@ -469,84 +593,129 @@ const App: React.FC = () => {
         </div>
 
         {/* RIGHT: RENDER & ANALYSIS */}
-        <div className="xl:col-span-4 flex flex-col gap-6">
-          <div className="bg-white rounded-[32px] p-8 shadow-xl border border-slate-100 flex-grow flex flex-col min-h-[600px] relative overflow-hidden">
-            {/* DECORATIVE BLOB */}
-            <div className="absolute -top-20 -right-20 w-64 h-64 bg-indigo-50 rounded-full blur-3xl opacity-50 pointer-events-none"></div>
+        <div className="xl:col-span-4 flex flex-col gap-8">
+          <div className="bg-white rounded-[40px] p-8 lg:p-10 shadow-[0_32px_80px_-20px_rgba(0,0,0,0.06)] border border-slate-100 flex-grow flex flex-col min-h-[600px] relative overflow-hidden group/render">
 
-            <h2 className="text-xl font-black mb-6 text-slate-800 flex items-center gap-3 relative z-10">
-              Rendu Final
-              <span className={`px-3 py-1 text-[10px] rounded-full uppercase tracking-widest ${analysis?.isCompliant ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
-                {analysis?.isCompliant ? 'Validé' : 'Aperçu'}
+            <div className="flex items-center justify-between mb-8 relative z-10">
+              <h2 className="text-2xl font-black text-slate-800 tracking-tight">Rendu Final</h2>
+              <span className={`px-4 py-1.5 text-[10px] font-black rounded-full uppercase tracking-widest shadow-sm ${analysis?.isCompliant ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-500'}`}>
+                {analysis?.isCompliant ? 'Bio-Validé' : 'Aperçu'}
               </span>
-            </h2>
+            </div>
 
-            <div className="flex-grow flex flex-col gap-6 relative z-10">
-              {sheetRender ? (
-                <div className="animate-in slide-in-from-right duration-500 flex flex-col h-full">
+            <div className="flex-grow flex flex-col gap-8 relative z-10">
+              {layoutConfig ? (
+                <div className="animate-in slide-in-from-right duration-1000 flex flex-col h-full">
 
-                  {/* PREVIEW CONTAINER */}
-                  <div className="flex-grow flex items-center justify-center p-4">
-                    <div className="relative group perspective-[1000px]">
-                      <div className="absolute inset-0 bg-indigo-500/20 blur-2xl rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-700"></div>
-                      <div className="relative bg-white p-2 shadow-[0_20px_50px_-12px_rgba(0,0,0,0.15)] rounded border border-slate-100 transition-transform duration-500 group-hover:rotate-x-2 group-hover:-translate-y-2">
-                        <img src={sheetRender} alt="Final" className="w-[280px] h-auto object-contain" />
-                        {/* PAPER TEXTURE OVERLAY (Optional) */}
-                        <div className="absolute inset-0 bg-gradient-to-tr from-black/5 to-transparent pointer-events-none mix-blend-multiply"></div>
+                  {/* INTERACTIVE PREVIEW CONTAINER */}
+                  <div className="flex-grow flex items-center justify-center p-6 bg-slate-50/50 rounded-[32px] border border-slate-100 shadow-inner relative overflow-hidden group/preview">
+
+                    {/* PAPER SIMULATION */}
+                    <div
+                      ref={previewContainerRef}
+                      className="relative bg-white shadow-[0_25px_60px_-15px_rgba(0,0,0,0.2)] border border-slate-100 overflow-hidden"
+                      style={{
+                        aspectRatio: `${layoutConfig.sheetWidth} / ${layoutConfig.sheetHeight}`,
+                        width: '100%',
+                        maxWidth: '300px'
+                      }}
+                    >
+                      {/* THE GRID (DRAGGABLE) */}
+                      <div
+                        onMouseDown={handleLayoutMouseDown}
+                        onTouchStart={handleLayoutMouseDown}
+                        className={`absolute cursor-move select-none transition-shadow ${isDraggingLayout ? 'shadow-2xl ring-2 ring-brand-500/20' : ''}`}
+                        style={{
+                          left: `${(layoutConfig.startX + layoutOffset.x) / layoutConfig.sheetWidth * 100}%`,
+                          top: `${(layoutConfig.startY + layoutOffset.y) / layoutConfig.sheetHeight * 100}%`,
+                          width: `${(layoutConfig.columnsUsed * layoutConfig.photoWidth + (layoutConfig.columnsUsed - 1) * layoutConfig.gap) / layoutConfig.sheetWidth * 100}%`,
+                          height: `${(layoutConfig.rows * layoutConfig.photoHeight + (layoutConfig.rows - 1) * layoutConfig.gap) / layoutConfig.sheetHeight * 100}%`,
+                          display: 'grid',
+                          gridTemplateColumns: `repeat(${layoutConfig.columnsUsed}, 1fr)`,
+                          gap: `${layoutConfig.gap / layoutConfig.sheetWidth * 100}%`
+                        }}
+                      >
+                        {Array.from({ length: photoCount }).map((_, i) => (
+                          <div key={i} className="bg-slate-100 overflow-hidden" style={{ aspectRatio: `${layoutConfig.photoWidth} / ${layoutConfig.photoHeight}` }}>
+                            <img src={finalRender || ''} alt="" className="w-full h-full object-cover" draggable={false} />
+                          </div>
+                        ))}
                       </div>
+
+                      {/* PAPER TEXTURE OVERLAY */}
+                      <div className="absolute inset-0 bg-gradient-to-tr from-slate-900/5 to-transparent pointer-events-none mix-blend-multiply opacity-30"></div>
+                      <div className="absolute inset-0 pointer-events-none opacity-20" style={{ backgroundImage: 'radial-gradient(#000 0.5px, transparent 0.5px)', backgroundSize: '10px 10px' }}></div>
+                    </div>
+
+                    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/80 backdrop-blur-lg text-white text-[8px] font-black uppercase tracking-widest px-4 py-2 rounded-full opacity-0 group-hover/preview:opacity-100 transition-opacity duration-300 pointer-events-none">
+                      Glisser pour ajuster
                     </div>
                   </div>
 
                   {/* ACTION GRID */}
-                  <div className="grid grid-cols-2 gap-3 mt-auto pt-6 border-t border-slate-50">
-                    <a
-                      href={sheetRender}
-                      download="PasseportPro_Planche.jpg"
-                      className="col-span-2 bg-slate-900 hover:bg-black text-white py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg hover:shadow-slate-500/20 hover:-translate-y-0.5"
-                    >
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" /></svg>
-                      Télécharger HD
-                    </a>
-
+                  <div className="grid grid-cols-2 gap-4 mt-8 pt-8 border-t border-slate-100">
                     <button
                       onClick={handlePrint}
-                      className="col-span-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
+                      className="col-span-1 bg-white hover:bg-slate-50 text-slate-900 border border-slate-200 py-4 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3 active:scale-95 shadow-sm"
                     >
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
+                      <svg className="w-4 h-4 text-brand-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
                       Imprimer
                     </button>
 
-                    <button
-                      onClick={() => setSheetRender(null)}
-                      className="col-span-1 bg-slate-50 hover:bg-slate-100 text-slate-600 py-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
+                    <a
+                      onClick={handleDownloadSheet}
+                      href="#"
+                      className="col-span-1 bg-brand-600 hover:bg-brand-700 text-white py-4 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3 shadow-xl shadow-brand-100 active:scale-95"
                     >
-                      Retour
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" /></svg>
+                      Exporter Planche
+                    </a>
+
+                    <button
+                      onClick={handleDownloadSingle}
+                      className="col-span-1 bg-brand-50 hover:bg-brand-100 text-brand-700 py-4 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3 active:scale-95 border border-brand-200"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12" /></svg>
+                      Photo Unique
+                    </button>
+
+                    <button
+                      onClick={() => setLayoutConfig(null)}
+                      className="col-span-2 bg-slate-50 hover:bg-slate-100 text-slate-500 py-4 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-3 active:scale-95"
+                    >
+                      Nouvelle Édition
                     </button>
                   </div>
 
-                  {/* AI FEEDBACK COMPACT */}
+                  {/* AI FEEDBACK PREMIUM */}
                   {analysis && (
-                    <div className={`mt-4 p-4 rounded-xl border text-xs ${analysis.isCompliant ? 'bg-emerald-50/50 border-emerald-100 text-emerald-800' : 'bg-rose-50/50 border-rose-100 text-rose-800'}`}>
-                      <div className="flex items-center justify-between font-bold mb-2">
-                        <span>Conformité IA</span>
-                        <span>{analysis.score}%</span>
+                    <div className={`mt-6 p-6 rounded-3xl border animate-in fade-in slide-in-from-bottom duration-700 ${analysis.isCompliant ? 'bg-emerald-50/50 border-emerald-100 shadow-emerald-100/20' : 'bg-rose-50/50 border-rose-100 shadow-rose-100/20'} shadow-lg`}>
+                      <div className="flex items-center justify-between font-black uppercase tracking-widest text-[10px] mb-4">
+                        <span className="text-slate-400">Analyse Biométrique</span>
+                        <span className={analysis.isCompliant ? 'text-emerald-600' : 'text-rose-600'}>{analysis.score}% Match</span>
                       </div>
-                      <div className="w-full bg-slate-200/50 h-1.5 rounded-full overflow-hidden mb-2">
-                        <div className={`h-full rounded-full ${analysis.isCompliant ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${analysis.score}%` }}></div>
+                      <div className="w-full bg-slate-200/30 h-2 rounded-full overflow-hidden mb-4 shadow-inner">
+                        <div className={`h-full rounded-full transition-all duration-1000 ${analysis.isCompliant ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${analysis.score}%` }}></div>
                       </div>
-                      {/* Just showing first feedback item for compactness */}
-                      <p className="opacity-80 truncate">{analysis.feedback[0]}</p>
+                      <ul className="space-y-2">
+                        {analysis.feedback.slice(0, 2).map((item, i) => (
+                          <li key={i} className="text-[11px] font-bold text-slate-600 flex items-start gap-3">
+                            <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0 ${analysis.isCompliant ? 'bg-emerald-400' : 'bg-rose-400'}`}></span>
+                            {item}
+                          </li>
+                        ))}
+                      </ul>
                     </div>
                   )}
 
                 </div>
               ) : (
-                <div className="flex-grow flex flex-col items-center justify-center p-8 bg-slate-50/50 rounded-2xl border border-dashed border-slate-200 group hover:bg-slate-50 transition-colors">
-                  <div className="w-16 h-16 bg-white rounded-2xl shadow-sm border border-slate-100 mb-4 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
-                    <svg className="w-6 h-6 text-slate-300 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                <div className="flex-grow flex flex-col items-center justify-center p-10 bg-slate-50/30 rounded-[40px] border-2 border-dashed border-slate-100 group/empty hover:bg-slate-50 transition-colors duration-500">
+                  <div className="w-20 h-20 bg-white rounded-[32px] shadow-sm border border-slate-100 mb-6 flex items-center justify-center group-hover/empty:scale-110 transition-transform duration-500">
+                    <svg className="w-8 h-8 text-slate-200 group-hover/empty:text-brand-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
                   </div>
-                  <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest text-center">Aucun rendu généré</p>
-                  <p className="text-slate-300 text-[10px] text-center mt-1">Cliquez sur VALIDER pour créer la planche</p>
+                  <p className="text-slate-400 text-[10px] font-black uppercase tracking-[0.3em] text-center">Aucun résultat</p>
+                  <p className="text-slate-300 text-[10px] font-bold text-center mt-2 group-hover/empty:text-slate-400 transition-colors">Appuyez sur VALIDER pour traiter la planche</p>
                 </div>
               )}
             </div>
@@ -554,61 +723,62 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* DRAGGABLE FLOATING TOOLBAR - FIXED Z-INDEX & NO CLIPPING */}
+      {/* DRAGGABLE FLOATING TOOLBAR */}
       {sourceImage && (
         <div
-          className={`fixed z-[9999] flex items-center gap-4 bg-slate-900/95 backdrop-blur-2xl p-4 pr-5 rounded-[28px] shadow-[0_40px_100px_-20px_rgba(0,0,0,0.6)] ring-1 ring-white/10 transition-all duration-300 ${isDraggingBar ? 'scale-105 opacity-90' : 'opacity-100 hover:shadow-indigo-500/10'}`}
+          className={`fixed z-[100] flex items-center gap-5 bg-slate-900/90 backdrop-blur-3xl p-4 pr-6 rounded-[32px] shadow-[0_40px_120px_-20px_rgba(0,0,0,0.6)] ring-1 ring-white/10 transition-all duration-500 ${isDraggingBar ? 'scale-105 opacity-80 cursor-grabbing' : 'opacity-100 hover:shadow-brand-500/20 cursor-grab hover:-translate-y-1'}`}
           style={{
             left: `${controlBarPos.x}px`,
             top: `${controlBarPos.y}px`,
-            cursor: isDraggingBar ? 'grabbing' : 'grab'
           }}
           onMouseDown={handleBarMouseDown}
           onTouchStart={handleBarMouseDown}
         >
           {/* DRAG HANDLE */}
-          <div className="pr-4 text-slate-600 border-r border-slate-800 flex items-center">
-            <svg className="w-6 h-6 opacity-30" fill="currentColor" viewBox="0 0 20 20"><path d="M7 2a2 2 0 10.001 4.001A2 2 0 007 2zm0 6a2 2 0 10.001 4.001A2 2 0 007 8zm0 6a2 2 0 10.001 4.001A2 2 0 007 14zm6-12a2 2 0 10.001 4.001A2 2 0 0013 2zm0 6a2 2 0 10.001 4.001A2 2 0 0013 8zm0 6a2 2 0 10.001 4.001A2 2 0 0013 14z" /></svg>
+          <div className="pr-4 text-slate-700 border-r border-slate-800 flex items-center">
+            <svg className="w-6 h-6 opacity-40" fill="currentColor" viewBox="0 0 20 20"><path d="M7 2a2 2 0 10.001 4.001A2 2 0 007 2zm0 6a2 2 0 10.001 4.001A2 2 0 007 8zm0 6a2 2 0 10.001 4.001A2 2 0 007 14zm6-12a2 2 0 10.001 4.001A2 2 0 0013 2zm0 6a2 2 0 10.001 4.001A2 2 0 0013 8zm0 6a2 2 0 10.001 4.001A2 2 0 0013 14z" /></svg>
           </div>
 
           {/* ZOOM GROUP */}
-          <div className="flex items-center gap-4 px-2">
-            <button onClick={() => setCrop(p => ({ ...p, scale: Math.max(0.01, p.scale * 0.9) }))} className="text-white/40 hover:text-white transition-colors p-1">
+          <div className="flex items-center gap-5 px-2">
+            <button onClick={() => setCrop(p => ({ ...p, scale: Math.max(0.01, p.scale * 0.9) }))} className="text-white/40 hover:text-white transition-colors p-1 active:scale-75">
               <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M20 12H4" /></svg>
             </button>
-            <input
-              type="range" min="0.01" max="3" step="0.001"
-              value={crop.scale}
-              onChange={(e) => setCrop(p => ({ ...p, scale: parseFloat(e.target.value) }))}
-              className="w-32 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-            />
-            <button onClick={() => setCrop(p => ({ ...p, scale: Math.min(5, p.scale * 1.1) }))} className="text-white/40 hover:text-white transition-colors p-1">
+            <div className="relative group/slider">
+              <input
+                type="range" min="0.01" max="3" step="0.001"
+                value={crop.scale}
+                onChange={(e) => setCrop(p => ({ ...p, scale: parseFloat(e.target.value) }))}
+                className="w-32 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-brand-500"
+              />
+            </div>
+            <button onClick={() => setCrop(p => ({ ...p, scale: Math.min(5, p.scale * 1.1) }))} className="text-white/40 hover:text-white transition-colors p-1 active:scale-75">
               <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M12 4v16m8-8H4" /></svg>
             </button>
           </div>
 
-          <div className="w-px h-10 bg-slate-800 mx-2"></div>
+          <div className="w-px h-10 bg-slate-800/50 mx-2"></div>
 
           {/* ACTIONS GROUP */}
-          <div className="flex items-center gap-2">
-            <button onClick={centerImage} className="text-white/70 hover:bg-slate-800 p-3 rounded-2xl transition-all" title="Centrer Photo">
+          <div className="flex items-center gap-3">
+            <button onClick={centerImage} className="text-white/60 hover:text-white hover:bg-slate-800/50 p-3.5 rounded-2xl transition-all active:scale-90" title="Centrer Photo">
               <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
             </button>
-            <button onClick={handleBackgroundRemoval} disabled={isRemovingBg || isAutoWorking} className="text-white/70 hover:bg-slate-800 p-3 rounded-2xl transition-all disabled:opacity-20" title="Nettoyage Fond (IA)">
+            <button onClick={handleBackgroundRemoval} disabled={isRemovingBg || isAutoWorking} className="text-white/60 hover:text-white hover:bg-slate-800/50 p-3.5 rounded-2xl transition-all disabled:opacity-20 active:scale-90" title="Nettoyage Fond (IA)">
               <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
             </button>
             <button
               onClick={handleAutoWork}
               disabled={isRemovingBg || isAutoWorking}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-3.5 rounded-[20px] text-xs font-black tracking-widest transition-all shadow-lg flex items-center gap-2 disabled:opacity-30 group"
+              className="bg-brand-600 hover:bg-brand-500 text-white px-7 py-4 rounded-[22px] text-[10px] font-black tracking-widest transition-all shadow-xl shadow-brand-900/20 flex items-center gap-3 disabled:opacity-30 group active:scale-95"
             >
               <svg className="w-4 h-4 animate-pulse group-hover:scale-125 transition-transform" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" /></svg>
-              AUTO WORK
+              MAGIC WORK
             </button>
             <button
-              onClick={generateFinalRender}
+              onClick={updateLayout}
               disabled={isRemovingBg || isAutoWorking}
-              className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3.5 rounded-[20px] text-xs font-black tracking-widest transition-all shadow-lg disabled:opacity-30"
+              className="bg-emerald-600 hover:bg-emerald-500 text-white px-7 py-4 rounded-[22px] text-[10px] font-black tracking-widest transition-all shadow-xl shadow-emerald-900/20 disabled:opacity-30 active:scale-95"
             >
               VALIDER
             </button>
@@ -616,36 +786,41 @@ const App: React.FC = () => {
         </div>
       )}
 
-      <footer className="px-12 py-10 flex flex-col md:flex-row items-center justify-between text-slate-300 text-[10px] font-black uppercase tracking-[0.3em] bg-white border-t border-slate-50">
-        <div className="flex items-center gap-4">
-          <span className="text-indigo-400">PassportPro Engine 2.8</span>
-          <span className="w-1.5 h-1.5 bg-slate-100 rounded-full"></span>
+      <footer className="px-12 py-10 flex flex-col md:flex-row items-center justify-between text-slate-300 text-[10px] font-black uppercase tracking-[0.4em] bg-white border-t border-slate-50 mt-auto">
+        <div className="flex items-center gap-6">
+          <span className="text-brand-500">PassportPro Engine 4.0</span>
+          <span className="w-2 h-2 bg-slate-100 rounded-full"></span>
           <span>DPI Optimized Export</span>
         </div>
-        <div className="flex gap-10 mt-6 md:mt-0">
-          <span className="hover:text-indigo-500 cursor-help transition-colors">Normes ISO 2024</span>
-          <span className="hover:text-indigo-500 cursor-help transition-colors">IA Validation Active</span>
+        <div className="flex gap-12 mt-8 md:mt-0">
+          <span className="hover:text-brand-500 cursor-help transition-colors">Normes ISO 2024</span>
+          <span className="hover:text-brand-500 cursor-help transition-colors">IA Match Active</span>
         </div>
       </footer>
 
       <style>{`
         input[type=range]::-webkit-slider-thumb {
           -webkit-appearance: none;
-          height: 20px;
-          width: 20px;
+          height: 22px;
+          width: 22px;
           border-radius: 50%;
-          background: #6366f1;
+          background: #3b82f6;
           cursor: pointer;
-          box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+          box-shadow: 0 10px 25px rgba(59, 130, 246, 0.4);
           border: 4px solid #0f172a;
-          margin-top: -8px;
+          margin-top: -9px;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        input[type=range]::-webkit-slider-thumb:hover {
+          transform: scale(1.1);
+          background: #60a5fa;
         }
         input[type=range]::-webkit-slider-runnable-track {
           width: 100%;
           height: 4px;
           cursor: pointer;
           background: #1e293b;
-          border-radius: 2px;
+          border-radius: 4px;
         }
         body { scroll-behavior: smooth; }
       `}</style>
